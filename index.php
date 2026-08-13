@@ -25,20 +25,20 @@ $dotenv->safeLoad();
  * README.md now has all the information.
  */
 $config = new OciConfig(
-    getenv('OCI_REGION'),
-    getenv('OCI_USER_ID'),
-    getenv('OCI_TENANCY_ID'),
-    getenv('OCI_KEY_FINGERPRINT'),
-    getenv('OCI_PRIVATE_KEY_FILENAME'),
+    (string) (getenv('OCI_REGION') ?: ''),
+    (string) (getenv('OCI_USER_ID') ?: ''),
+    (string) (getenv('OCI_TENANCY_ID') ?: ''),
+    (string) (getenv('OCI_KEY_FINGERPRINT') ?: ''),
+    (string) (getenv('OCI_PRIVATE_KEY_FILENAME') ?: ''),
     getenv('OCI_AVAILABILITY_DOMAIN') ?: null, // null or '' or 'jYtI:PHX-AD-1' or ['jYtI:PHX-AD-1','jYtI:PHX-AD-2']
-    getenv('OCI_SUBNET_ID'),
-    getenv('OCI_IMAGE_ID'),
-    (int) getenv('OCI_OCPUS'),
-    (int) getenv('OCI_MEMORY_IN_GBS')
+    (string) (getenv('OCI_SUBNET_ID') ?: ''),
+    (string) (getenv('OCI_IMAGE_ID') ?: ''),
+    (int) (getenv('OCI_OCPUS') ?: 4),
+    (int) (getenv('OCI_MEMORY_IN_GBS') ?: 24)
 );
 
-$bootVolumeSizeInGBs = (string) getenv('OCI_BOOT_VOLUME_SIZE_IN_GBS');
-$bootVolumeId = (string) getenv('OCI_BOOT_VOLUME_ID');
+$bootVolumeSizeInGBs = (string) (getenv('OCI_BOOT_VOLUME_SIZE_IN_GBS') ?: '');
+$bootVolumeId = (string) (getenv('OCI_BOOT_VOLUME_ID') ?: '');
 if ($bootVolumeSizeInGBs) {
     $config->setBootVolumeSizeInGBs($bootVolumeSizeInGBs);
 } elseif ($bootVolumeId) {
@@ -64,62 +64,85 @@ $notifier = (function (): \Hitrov\Interfaces\NotifierInterface {
     return new \Hitrov\Notification\Telegram();
 })();
 
-$shape = getenv('OCI_SHAPE');
+$shape = (string) (getenv('OCI_SHAPE') ?: 'VM.Standard.A1.Flex');
 
 $maxRunningInstancesOfThatShape = 1;
 if (getenv('OCI_MAX_INSTANCES') !== false) {
     $maxRunningInstancesOfThatShape = (int) getenv('OCI_MAX_INSTANCES');
 }
 
-$instances = $api->getInstances($config);
+try {
+    $instances = $api->getInstances($config);
 
-$existingInstances = $api->checkExistingInstances($config, $instances, $shape, $maxRunningInstancesOfThatShape);
-if ($existingInstances) {
-    echo "$existingInstances\n";
-    return;
-}
-
-if (!empty($config->availabilityDomains)) {
-    if (is_array($config->availabilityDomains)) {
-        $availabilityDomains = $config->availabilityDomains;
-    } else {
-        $availabilityDomains = [ $config->availabilityDomains ];
-    }
-} else {
-    $availabilityDomains = $api->getAvailabilityDomains($config);
-}
-
-foreach ($availabilityDomains as $availabilityDomainEntity) {
-    $availabilityDomain = is_array($availabilityDomainEntity) ? $availabilityDomainEntity['name'] : $availabilityDomainEntity;
-    try {
-        $instanceDetails = $api->createInstance($config, $shape, getenv('OCI_SSH_PUBLIC_KEY'), $availabilityDomain);
-    } catch(ApiCallException $e) {
-        $message = $e->getMessage();
-        echo "$message\n";
-//            if ($notifier->isSupported()) {
-//                $notifier->notify($message);
-//            }
-
-        if (
-            $e->getCode() === 500 &&
-            strpos($message, 'InternalError') !== false &&
-            strpos($message, 'Out of host capacity') !== false
-        ) {
-            // trying next availability domain
-            sleep(16);
-            continue;
-        }
-
-        // current config is broken
+    $existingInstances = $api->checkExistingInstances($config, $instances, $shape, $maxRunningInstancesOfThatShape);
+    if ($existingInstances) {
+        echo "$existingInstances\n";
         return;
     }
 
-    // success
-    $message = json_encode($instanceDetails, JSON_PRETTY_PRINT);
-    echo "$message\n";
-    if ($notifier->isSupported()) {
-        $notifier->notify($message);
+    if (!empty($config->availabilityDomains)) {
+        if (is_array($config->availabilityDomains)) {
+            $availabilityDomains = $config->availabilityDomains;
+        } else {
+            $availabilityDomains = [ $config->availabilityDomains ];
+        }
+    } else {
+        $availabilityDomains = $api->getAvailabilityDomains($config);
     }
 
-    return;
+    foreach ($availabilityDomains as $availabilityDomainEntity) {
+        $availabilityDomain = is_array($availabilityDomainEntity) ? $availabilityDomainEntity['name'] : $availabilityDomainEntity;
+        try {
+            $instanceDetails = $api->createInstance($config, $shape, (string) (getenv('OCI_SSH_PUBLIC_KEY') ?: ''), $availabilityDomain);
+        } catch (\Hitrov\Exception\TooManyRequestsWaiterException $e) {
+            echo $e->getMessage() . "\n";
+            echo "Sleeping for 60 seconds to prevent hot loop...\n";
+            sleep(60);
+            return;
+        } catch(ApiCallException $e) {
+            $message = $e->getMessage();
+            echo "$message\n";
+
+            if (
+                $e->getCode() === 500 &&
+                strpos($message, 'InternalError') !== false &&
+                strpos($message, 'Out of host capacity') !== false
+            ) {
+                // trying next availability domain
+                sleep(16);
+                continue;
+            }
+
+            // current config is broken
+            echo "Config error occurred. Sleeping for 60 seconds...\n";
+            sleep(60);
+            return;
+        }
+
+        // success
+        $message = json_encode($instanceDetails, JSON_PRETTY_PRINT);
+        echo "$message\n";
+        if ($notifier->isSupported()) {
+            $notifier->notify($message);
+        }
+
+        return;
+    }
+
+    // Loop finished without success, sleep 60 seconds to prevent hot loop
+    echo "All availability domains checked. Sleeping for 60 seconds before next try...\n";
+    sleep(60);
+
+} catch (\Hitrov\Exception\TooManyRequestsWaiterException $e) {
+    echo $e->getMessage() . "\n";
+    echo "Sleeping for 60 seconds to prevent hot loop...\n";
+    sleep(60);
+} catch (ApiCallException $e) {
+    echo $e->getMessage() . "\n";
+    echo "API call failed. Sleeping for 60 seconds...\n";
+    sleep(60);
+} catch (\Throwable $e) {
+    echo "An unexpected error occurred: " . $e->getMessage() . "\n";
+    echo "Sleeping for 60 seconds...\n";
+    sleep(60);
 }
